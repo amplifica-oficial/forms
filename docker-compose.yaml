@@ -1,0 +1,23 @@
+
+services:
+  backend:
+    build:
+      context: backend
+    ports:
+      - '5000:5000'
+    restart: unless-stopped
+    environment:
+      GOMEMLIMIT: 175MiB
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+          cpus: '0.25'
+    develop:
+      watch:
+        - action: rebuild
+          path: ./backend/cmd
+
+  
+
+
