@@ -1,7 +1,6 @@
 package main
 
 import (
-	"context"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -15,35 +14,30 @@ import (
 // HandlerFuncError is a function that handles a request and returns an error.
 type HandlerFuncError func(w http.ResponseWriter, r *http.Request) error
 
-// ServeHTTP implements the http.Handler interface while handling errors.
-func (handler HandlerFuncError) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	err := handler(w, r)
-	if err != nil {
-		sendError(r.Context(), w, err)
-	}
-}
-
 // HandleError is a helper function that wraps a HandlerFuncError with error handling.
 func HandleError(f HandlerFuncError) http.HandlerFunc {
 	return f.ServeHTTP
 }
 
-// sendError is a helper function that sends an error to the client.
-func sendError(ctx context.Context, w http.ResponseWriter, err error) {
-	var traceLiner ErrTraceLiner
+// ServeHTTP implements the http.Handler interface while handling errors.
+func (handler HandlerFuncError) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	err := handler(w, r)
+	if err != nil {
+		var traceLiner ErrTraceLiner
 
-	// Log the error with the line it occurred on
-	log := []any{
-		"error", err,
-	}
-	if errors.As(err, &traceLiner) {
-		log = append(log, "from", traceLiner.TraceLine())
-	}
-	slog.Error("request-error", log...)
+		// Log the error with the line it occurred on
+		log := []any{
+			"error", err,
+		}
+		if errors.As(err, &traceLiner) {
+			log = append(log, "from", traceLiner.TraceLine())
+		}
+		slog.Error("request-error", log...)
 
-	errCode, statusCode := getCodes(err)
-	w.WriteHeader(statusCode)
-	fmt.Fprintf(w, "{\"error\": \"%s\"}", errCode)
+		errCode, statusCode := getCodes(err)
+		w.WriteHeader(statusCode)
+		fmt.Fprintf(w, "{\"error\": \"%s\"}\n", errCode)
+	}
 }
 
 // ErrorStatus is a list of errors and their corresponding status codes.
@@ -199,6 +193,16 @@ func TraceLine(skip int) string {
 	return fmt.Sprintf("%s %s:%d", funcName, file, line)
 }
 
+func Err(err error) error {
+	if err == nil {
+		return nil
+	}
+	return &Error{
+		error: err,
+		traceLine: TraceLine(1),
+	}
+}
+
 func newError(err string, fmtargs ...any) *Error {
 	e := &Error{
 		err:       err,
@@ -215,7 +219,11 @@ func newError(err string, fmtargs ...any) *Error {
 // Error returns the error message
 func (e *Error) Error() string {
 	if e.error != nil {
-		return fmt.Sprintf("%v: %v", e.err, e.error)
+		if e.err != "" {
+			return fmt.Sprintf("%v: %v", e.err, e.error)
+		} else {
+			return e.error.Error()
+		}
 	}
 	return e.err
 }

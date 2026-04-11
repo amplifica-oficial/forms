@@ -4,6 +4,7 @@ go 1.26.2
 
 require (
 	github.com/google/uuid v1.6.0
+	github.com/mattn/go-sqlite3 v1.14.42
 	github.com/mitchellh/mapstructure v1.5.1-0.20231216201459-8508981c8b6c
 )
 

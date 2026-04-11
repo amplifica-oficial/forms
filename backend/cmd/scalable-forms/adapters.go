@@ -19,14 +19,18 @@ func IsNilType(v any) bool {
 	return isConcrete || isPtr
 }
 
-type Request[Query, Body any] struct {
+type Validator interface {
+	Validate() string
+}
+
+type Request[Query any, Body Validator] struct {
 	Query Query
 	Body  Body
 }
 
-type Requester[Q, B any] func(ctx context.Context, request Request[Q, B]) error
+type Requester[Q any, B Validator] func(ctx context.Context, request Request[Q, B]) error
 
-func HandleRequester[Q, B any](fn Requester[Q, B]) http.HandlerFunc {
+func HandleRequester[Q any, B Validator](fn Requester[Q, B]) http.HandlerFunc {
 	return HandleError(func(w http.ResponseWriter, r *http.Request) error {
 		ctx := r.Context()
 
@@ -58,9 +62,9 @@ func HandleRequester[Q, B any](fn Requester[Q, B]) http.HandlerFunc {
 	})
 }
 
-type RequestReturner[Q, B, R any] func(ctx context.Context, request Request[Q, B]) (R, error)
+type RequestReturner[Q any, B Validator, R any] func(ctx context.Context, request Request[Q, B]) (R, error)
 
-func HandleRequestReturner[Q, B, R any](fn RequestReturner[Q, B, R]) http.HandlerFunc {
+func HandleRequestReturner[Q any, B Validator, R any](fn RequestReturner[Q, B, R]) http.HandlerFunc {
 	return HandleError(func(w http.ResponseWriter, r *http.Request) error {
 		ctx := r.Context()
 

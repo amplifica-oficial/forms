@@ -2,16 +2,20 @@ package main
 
 import (
 	"context"
+	"database/sql"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
+	"net/mail"
 	"net/url"
 	"os"
+	"regexp"
 	"strings"
 	"time"
 
-	"github.com/google/uuid"
+	_ "github.com/mattn/go-sqlite3"
 )
 
 type Middleware = func(http.Handler) http.Handler
@@ -170,87 +174,119 @@ func WithRequestTime(ctx context.Context, t time.Time) context.Context {
 	return context.WithValue(ctx, keyRequestTime, t)
 }
 
-type FormResponse struct {
-	Form uuid.UUID
-
-	Email string
-	Name  string
-
-	Synced bool
-
-	CreatedAt time.Time
+type Service struct {
+	client    http.Client
+	db        *sql.DB
 }
 
-type FormConfiguration struct {
-	ID     uuid.UUID
+func Time(t *time.Time) *string {
+	if (t == nil) {
+		return nil
+	}
+	v := t.UTC().Format(time.RFC3339)
+	return &v
+}
+
+func Now() string {
+	return time.Now().UTC().Format(time.RFC3339)
+}
+
+type PutFormReq struct {
 	Slug   string
 	Target string
+	TargetToken string
 
 	Open  *time.Time
 	Close *time.Time
-
-	MaxAge               *time.Duration
-	StaleWhileRevalidate *time.Duration
-
-	CreatedAt time.Time
-	UpdatedAt time.Time
 }
 
-type Service struct {
-	configs   map[string]FormConfiguration
-	responses []FormResponse
-	client    http.Client
-}
+var reValidateSlug = regexp.MustCompile(`^[a-z\-]{3,}$`)
 
-func (s *Service) PutFormConfiguration(ctx context.Context, req Request[Nil, FormConfiguration]) (*FormConfiguration, error) {
-	config := req.Body
-
-	config.Slug = strings.TrimSpace(config.Slug)
-	if config.Slug == "" {
-		return nil, ErrBadRequest("bad slug")
+func (r PutFormReq) Validate() string {
+	if !reValidateSlug.MatchString(r.Slug) {
+		return "slug"
 	}
 
-	config.Target = strings.TrimSpace(config.Target)
-	_, err := url.Parse(config.Target)
+	if r.Target == ""{
+		return "target"
+	}
+	targetURL, err := url.Parse(r.Target)
 	if err != nil {
-		return nil, ErrBadRequest("bad target url: %v", err)
+		return "target"
+	}
+	if r.Target != targetURL.String() {
+		return "target"
+	}
+	if targetURL.Scheme != "https" && targetURL.Scheme != "http" {
+		return "target"
 	}
 
-	if form, ok := s.configs[config.Slug]; ok {
-		if form.ID != config.ID && config.ID != uuid.Nil {
-			return nil, ErrConflict("form already exists with another ID")
+	if r.Open != nil && r.Close != nil {
+		if r.Open.After(*r.Close) {
+			return "time"
 		}
-
-		config.ID = form.ID
-		config.CreatedAt = form.CreatedAt
-		config.UpdatedAt = RequestTimeFrom(ctx)
-		s.configs[config.Slug] = config
-	} else {
-		config.ID = uuid.New()
-		config.CreatedAt = RequestTimeFrom(ctx)
-		config.UpdatedAt = RequestTimeFrom(ctx)
-		s.configs[config.Slug] = config
 	}
 
-	return &config, nil
+	return ""
 }
 
-type FormResponseRequest struct {
-	Slug string
+func (s *Service) PutForm(ctx context.Context, req Request[Nil, PutFormReq]) (*PutFormReq, error) {
+	form := req.Body
+
+	now := RequestTimeFrom(ctx)
+
+	_, err := s.db.ExecContext(ctx, `
+		INSERT INTO form (slug, target, target_token, open, close, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?)
+		ON CONFLICT (slug) DO UPDATE
+			SET target       = excluded.target,
+				target_token = excluded.target_token,
+				open         = excluded.open,
+				close        = excluded.close,
+				updated_at   = excluded.updated_at
+	`, form.Slug, form.Target, form.TargetToken, Time(form.Open), Time(form.Close), Time(&now), Time(&now))
+	if err != nil {
+		return nil, Err(err)
+	}
+
+	return &form, nil
+}
+
+type CreateResponseReq struct {
+	Slug  string
 	Email string
 	Name  string
+}
+
+func (r CreateResponseReq) Validate() string {
+	if !reValidateSlug.MatchString(r.Slug) {
+		return "slug"
+	}
+
+	email, err := mail.ParseAddress(r.Email)
+	if err != nil {
+		return "e-mail"
+	}
+	if email.Address != r.Email {
+		return "e-mail"
+	}
+
+	if r.Name != strings.TrimSpace(r.Name) || r.Name == "" {
+		return "name"
+	}
+
+	return ""
 }
 
 type FormResponseToken struct {
-	Form uuid.UUID
-	Slug string
-	Email string
-	Name  string
+	Slug      string
+	Email     string
+	Name      string
 	CreatedAt time.Time
 	Signature string
 }
 
-func (s *Service) CreateFormResponse(ctx context.Context, req Request[Nil, FormResponseRequest]) (*FormResponseToken, error) {
+func (s *Service) CreateResponse(ctx context.Context, req Request[Nil, CreateResponseReq]) (*FormResponseToken, error) {
 	resp := req.Body
 
 	resp.Slug = strings.TrimSpace(resp.Slug)
@@ -261,26 +297,34 @@ func (s *Service) CreateFormResponse(ctx context.Context, req Request[Nil, FormR
 		return nil, ErrBadRequest("name or email missing")
 	}
 
-	form, ok := s.configs[resp.Slug]
-	if !ok {
-		return nil, ErrNotFound("this form does not exist: %s", resp.Slug)
+	var formID int
+	var formOpen, formClose *time.Time
+
+	if err := RunTx(ctx, s.db, func(db *sql.Tx) error {
+
+		formRow := db.QueryRowContext(ctx, `SELECT id, open, close FROM form WHERE slug = ?`, resp.Slug)
+		if err := formRow.Scan(&formID, &formOpen, &formClose); err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				return ErrNotFound("form not found: '%s'", resp.Slug)
+			}
+			return Err(err)
+		}
+
+		now := RequestTimeFrom(ctx)
+		_, err := db.ExecContext(ctx, `INSERT INTO response (form_id, email, name, created_at) VALUES (?, ?, ?, ?)`, formID, resp.Email, resp.Name, Time(&now))
+		if err != nil {
+			return Err(err)
+		}
+
+		return nil
+	}); err != nil {
+		return nil, err
 	}
-
-
-	response := FormResponse{
-		Form: form.ID,
-		Email: resp.Email, // TODO: validate
-		Name: resp.Name,
-		CreatedAt: RequestTimeFrom(ctx),
-	}
-
-	s.responses = append(s.responses, response)
 
 	token := FormResponseToken{
-		Form: form.ID,
-		Slug: form.Slug,
-		Email: resp.Email, // TODO: validate
-		Name: resp.Name,
+		Slug:      resp.Slug,
+		Email:     resp.Email, // TODO: validate
+		Name:      resp.Name,
 		CreatedAt: RequestTimeFrom(ctx),
 		Signature: "i-say-its-ok",
 	}
@@ -288,8 +332,105 @@ func (s *Service) CreateFormResponse(ctx context.Context, req Request[Nil, FormR
 	return &token, nil
 }
 
+func RunTx(ctx context.Context, db *sql.DB, fn func(db *sql.Tx) error) error {
+	var err error
+	tx, err := db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelLinearizable})
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	err = fn(tx)
+	if err != nil {
+		return err
+	}
+
+	err = tx.Commit()
+	if err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func RunMigrations(ctx context.Context, db *sql.DB) error {
+	_, err := db.Exec(`CREATE TABLE IF NOT EXISTS migration (
+		version INTEGER PRIMARY KEY,
+		migrated_at DATETIME
+	)`)
+	if err != nil {
+		return Err(err)
+	}
+
+	version := 0
+
+	row := db.QueryRowContext(ctx, `SELECT coalesce(max(version), 0) FROM migration`)
+	if err = row.Scan(&version); err != nil {
+		return Err(err)
+	}
+
+	if err == nil && version < 1 {
+		slog.Debug("db-migration-1")
+		err = RunTx(ctx, db, func(db *sql.Tx) error {
+			_, err := db.ExecContext(ctx, `CREATE TABLE form (
+				id   INTEGER PRIMARY KEY,
+				slug TEXT NOT NULL UNIQUE,
+
+				target       TEXT NOT NULL,
+				target_token TEXT,
+
+				open  DATETIME,
+				close DATETIME,
+
+				created_at DATETIME NOT NULL,
+				updated_at DATETIME NOT NULL
+			)`)
+			if err != nil {
+				return Err(err)
+			}
+
+			_, err = db.ExecContext(ctx, `CREATE TABLE response (
+				id INTEGER PRIMARY KEY,
+
+				form_id INTEGER NOT NULL,
+				email   TEXT NOT NULL,
+				name    TEXT NOT NULL,
+				synced  BOOLEAN NOT NULL DEFAULT 0,
+				created_at DATETIME NOT NULL,
+
+				UNIQUE(form_id, email)
+			)`)
+			if err != nil {
+				return Err(err)
+			}
+
+			_, err = db.ExecContext(ctx, `INSERT INTO migration (version, migrated_at) VALUES (?, ?)`, 1, Now())
+			if err != nil {
+				return Err(err)
+			}
+
+			return nil
+		})
+	}
+
+	return err
+}
+
 func main() {
 	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelDebug})))
+
+	db, err := sql.Open("sqlite3", "forms.db?cache=private&_fk=1&_journal=WAL&_writable_schema=0")
+	if err != nil {
+		slog.Error("db-open", "error", err)
+		os.Exit(-1)
+	}
+
+	slog.Debug("start-migrations")
+	ctx := context.Background()
+	if err := RunMigrations(ctx, db); err != nil {
+		slog.Error("db-migrations", "error", err)
+		os.Exit(-1)
+	}
 
 	mux := http.NewServeMux()
 	m := NewMiddlewareGroup(
@@ -298,18 +439,18 @@ func main() {
 		LogRequests,
 	)
 	s := Service{
+		db: db,
 		client: http.Client{
 			Timeout: 10 * time.Second,
 		},
-		configs: map[string]FormConfiguration{},
 	}
 
 	mux.Handle("GET /", m.ApplyFn(func(w http.ResponseWriter, r *http.Request) {
 		w.Write([]byte("ok\n"))
 	}))
 
-	mux.Handle("PUT /PutFormConfiguration", m.ApplyFn(HandleRequestReturner(s.PutFormConfiguration)))
-	mux.Handle("POST /CreateFormResponse", m.ApplyFn(HandleRequestReturner(s.CreateFormResponse)))
+	mux.Handle("PUT /PutForm", m.ApplyFn(HandleRequestReturner(s.PutForm)))
+	mux.Handle("POST /CreateResponse", m.ApplyFn(HandleRequestReturner(s.CreateResponse)))
 
 	server := http.Server{
 		Addr: ":5000",
@@ -322,8 +463,7 @@ func main() {
 	}
 
 	slog.Info("start-server", "addr", server.Addr)
-	err := server.ListenAndServe()
-	if err != nil {
+	if err := server.ListenAndServe(); err != nil {
 		fmt.Fprintf(os.Stderr, "server shutdown: %v", err)
 	}
 }

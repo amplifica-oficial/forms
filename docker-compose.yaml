@@ -1,4 +1,3 @@
-
 services:
   backend:
     build:
@@ -17,7 +16,4 @@ services:
       watch:
         - action: rebuild
           path: ./backend/cmd
-
-  
-
 
