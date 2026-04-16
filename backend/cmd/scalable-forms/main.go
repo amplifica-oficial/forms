@@ -11,6 +11,7 @@ import (
 	"net/mail"
 	"net/url"
 	"os"
+	"reflect"
 	"regexp"
 	"strings"
 	"time"
@@ -175,12 +176,13 @@ func WithRequestTime(ctx context.Context, t time.Time) context.Context {
 }
 
 type Service struct {
-	client    http.Client
-	db        *sql.DB
+	client http.Client
+	db     *sql.DB
+	config Config
 }
 
 func Time(t *time.Time) *string {
-	if (t == nil) {
+	if t == nil {
 		return nil
 	}
 	v := t.UTC().Format(time.RFC3339)
@@ -192,9 +194,12 @@ func Now() string {
 }
 
 type PutFormReq struct {
-	Slug   string
-	Target string
+	Slug        string
+	Target      string
 	TargetToken string
+
+	EmailDomain  string
+	RequireLogin bool
 
 	Open  *time.Time
 	Close *time.Time
@@ -207,7 +212,7 @@ func (r PutFormReq) Validate() string {
 		return "slug"
 	}
 
-	if r.Target == ""{
+	if r.Target == "" {
 		return "target"
 	}
 	targetURL, err := url.Parse(r.Target)
@@ -236,16 +241,41 @@ func (s *Service) PutForm(ctx context.Context, req Request[Nil, PutFormReq]) (*P
 	now := RequestTimeFrom(ctx)
 
 	_, err := s.db.ExecContext(ctx, `
-		INSERT INTO form (slug, target, target_token, open, close, created_at, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?)
+		INSERT INTO form (slug, target, target_token, open, close, requires_login, email_domain, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT (slug) DO UPDATE
-			SET target       = excluded.target,
-				target_token = excluded.target_token,
-				open         = excluded.open,
-				close        = excluded.close,
-				updated_at   = excluded.updated_at
-	`, form.Slug, form.Target, form.TargetToken, Time(form.Open), Time(form.Close), Time(&now), Time(&now))
+			SET target         = excluded.target,
+				target_token   = excluded.target_token,
+				open           = excluded.open,
+				close          = excluded.close,
+				requires_login = excluded.requires_login,
+				email_domain   = excluded.email_domain,
+				updated_at     = excluded.updated_at
+	`, form.Slug, form.Target, form.TargetToken, Time(form.Open), Time(form.Close), form.RequireLogin, form.EmailDomain, Time(&now), Time(&now))
 	if err != nil {
+		return nil, Err(err)
+	}
+
+	return &form, nil
+}
+
+type FormInfo struct {
+	Open          *time.Time
+	Close         *time.Time
+	RequiresLogin bool
+}
+
+func (s *Service) ClientGetFormInfo(ctx context.Context, req Request[struct {
+	Slug string `url:"param"`
+}, Nil]) (*FormInfo, error) {
+	slug := req.Query.Slug
+
+	var form FormInfo
+	formRow := s.db.QueryRowContext(ctx, `SELECT open, close, requires_login FROM form WHERE slug = ?`, slug)
+	if err := formRow.Scan(&form.Open, &form.Close, &form.RequiresLogin); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, ErrNotFound("form not found: '%s'", slug)
+		}
 		return nil, Err(err)
 	}
 
@@ -287,31 +317,42 @@ type FormResponseToken struct {
 }
 
 func (s *Service) CreateResponse(ctx context.Context, req Request[Nil, CreateResponseReq]) (*FormResponseToken, error) {
-	resp := req.Body
+	data := req.Body
 
-	resp.Slug = strings.TrimSpace(resp.Slug)
-	resp.Name = strings.TrimSpace(resp.Name)
-	resp.Email = strings.TrimSpace(resp.Email)
+	data.Slug = strings.TrimSpace(data.Slug)
+	data.Name = strings.TrimSpace(data.Name)
+	data.Email = strings.TrimSpace(data.Email)
 
-	if resp.Name == "" || resp.Email == "" {
+	if data.Name == "" || data.Email == "" {
 		return nil, ErrBadRequest("name or email missing")
 	}
 
 	var formID int
 	var formOpen, formClose *time.Time
+	var formEmailDomain string
+	var formRequiresLogin bool
 
 	if err := RunTx(ctx, s.db, func(db *sql.Tx) error {
-
-		formRow := db.QueryRowContext(ctx, `SELECT id, open, close FROM form WHERE slug = ?`, resp.Slug)
-		if err := formRow.Scan(&formID, &formOpen, &formClose); err != nil {
+		formRow := db.QueryRowContext(ctx, `SELECT id, open, close, requires_login FROM form WHERE slug = ?`, data.Slug)
+		if err := formRow.Scan(&formID, &formOpen, &formClose, &formRequiresLogin); err != nil {
 			if errors.Is(err, sql.ErrNoRows) {
-				return ErrNotFound("form not found: '%s'", resp.Slug)
+				return ErrNotFound("form not found: '%s'", data.Slug)
 			}
 			return Err(err)
 		}
 
 		now := RequestTimeFrom(ctx)
-		_, err := db.ExecContext(ctx, `INSERT INTO response (form_id, email, name, created_at) VALUES (?, ?, ?, ?)`, formID, resp.Email, resp.Name, Time(&now))
+		if formOpen != nil && formOpen.Before(now) {
+			return ErrNotFound("form '%s' opens at %v", data.Slug, formOpen)
+		}
+		if formClose != nil && formClose.After(now) {
+			return ErrNotFound("form '%s' closed at %v", data.Slug, formClose)
+		}
+		if formEmailDomain != "" && !strings.HasSuffix(data.Email, "@"+formEmailDomain) {
+			return ErrBadRequest("this email does not belong to the expected")
+		}
+
+		_, err := db.ExecContext(ctx, `INSERT INTO response (form_id, email, name, created_at) VALUES (?, ?, ?, ?)`, formID, data.Email, data.Name, Time(&now))
 		if err != nil {
 			return Err(err)
 		}
@@ -322,9 +363,9 @@ func (s *Service) CreateResponse(ctx context.Context, req Request[Nil, CreateRes
 	}
 
 	token := FormResponseToken{
-		Slug:      resp.Slug,
-		Email:     resp.Email, // TODO: validate
-		Name:      resp.Name,
+		Slug:      data.Slug,
+		Email:     data.Email,
+		Name:      data.Name,
 		CreatedAt: RequestTimeFrom(ctx),
 		Signature: "i-say-its-ok",
 	}
@@ -369,7 +410,7 @@ func RunMigrations(ctx context.Context, db *sql.DB) error {
 		return Err(err)
 	}
 
-	if err == nil && version < 1 {
+	if version < 1 {
 		slog.Debug("db-migration-1")
 		err = RunTx(ctx, db, func(db *sql.Tx) error {
 			_, err := db.ExecContext(ctx, `CREATE TABLE form (
@@ -377,10 +418,12 @@ func RunMigrations(ctx context.Context, db *sql.DB) error {
 				slug TEXT NOT NULL UNIQUE,
 
 				target       TEXT NOT NULL,
-				target_token TEXT,
+				target_token TEXT NOT NULL,
 
 				open  DATETIME,
 				close DATETIME,
+				requires_login BOOLEAN NOT NULL,
+				email_domain TEXT NOT NULL,
 
 				created_at DATETIME NOT NULL,
 				updated_at DATETIME NOT NULL
@@ -416,6 +459,51 @@ func RunMigrations(ctx context.Context, db *sql.DB) error {
 	return err
 }
 
+type Config struct {
+	API_URL string `default:""`
+
+	JWT_DURATION    time.Duration `default:"5m"`
+	JWT_SIGNING_KEY string        `default:""`
+
+	MAX_LOGIN_DURATION time.Duration `default:"5m"`
+
+	OAUTH_GOOGLE_KEY    string `default:""`
+	OAUTH_GOOGLE_SECRET string `default:""`
+}
+
+func MustLoadConfig() Config {
+	config := Config{}
+
+	configValue := reflect.ValueOf(&config).Elem()
+	configType := configValue.Type()
+	for i := 0; i < configType.NumField(); i++ {
+		fieldType := configType.Field(i)
+		fieldValue := configValue.Field(i)
+
+		value, ok := os.LookupEnv(fieldType.Name)
+		if !ok {
+			value, ok = fieldType.Tag.Lookup("default")
+			if !ok {
+				panic(fmt.Sprintf("no env value for config %s, which has no default", fieldType.Name))
+			}
+		}
+
+		field := fieldValue.Interface()
+		switch field.(type) {
+		case string:
+			fieldValue.SetString(value)
+		case time.Duration:
+			duration, err := time.ParseDuration(value)
+			if err != nil {
+				panic(fmt.Sprintf("invalid duration '%s' for env %s", value, fieldType.Name))
+			}
+			fieldValue.SetInt(int64(duration))
+		}
+	}
+
+	return config
+}
+
 func main() {
 	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelDebug})))
 
@@ -435,7 +523,7 @@ func main() {
 	mux := http.NewServeMux()
 	m := NewMiddlewareGroup(
 		AddRequestTime,
-		LimitBody(2*1024*1024),
+		LimitBody(2*1024),
 		LogRequests,
 	)
 	s := Service{
@@ -443,6 +531,7 @@ func main() {
 		client: http.Client{
 			Timeout: 10 * time.Second,
 		},
+		config: MustLoadConfig(),
 	}
 
 	mux.Handle("GET /", m.ApplyFn(func(w http.ResponseWriter, r *http.Request) {

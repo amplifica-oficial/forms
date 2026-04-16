@@ -13,6 +13,10 @@ import (
 
 type Nil struct {}
 
+func (Nil) Validate() string {
+	return ""
+}
+
 func IsNilType(v any) bool {
 	_, isConcrete := v.(Nil)
 	_, isPtr := v.(*Nil)
