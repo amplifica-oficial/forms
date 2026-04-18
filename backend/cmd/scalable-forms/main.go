@@ -2,7 +2,9 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
 	"database/sql"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"io"
@@ -16,6 +18,9 @@ import (
 	"strings"
 	"time"
 
+	"github.com/golang-jwt/jwt/v5"
+	"github.com/markbates/goth"
+	"github.com/markbates/goth/providers/google"
 	_ "github.com/mattn/go-sqlite3"
 )
 
@@ -181,6 +186,16 @@ type Service struct {
 	config Config
 }
 
+func (s *Service) GetProvider() goth.Provider {
+	provider := google.New(s.config.OAUTH_GOOGLE_KEY, s.config.OAUTH_GOOGLE_SECRET, s.config.FRONTEND_URL,
+		"https://www.googleapis.com/auth/userinfo.email",
+		"https://www.googleapis.com/auth/userinfo.profile",
+	)
+	provider.SetPrompt("select_account")
+
+	return provider
+}
+
 func Time(t *time.Time) *string {
 	if t == nil {
 		return nil
@@ -242,7 +257,7 @@ func (s *Service) PutForm(ctx context.Context, req Request[Nil, PutFormReq]) (*P
 
 	_, err := s.db.ExecContext(ctx, `
 		INSERT INTO form (slug, target, target_token, open, close, requires_login, email_domain, created_at, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT (slug) DO UPDATE
 			SET target         = excluded.target,
 				target_token   = excluded.target_token,
@@ -260,26 +275,126 @@ func (s *Service) PutForm(ctx context.Context, req Request[Nil, PutFormReq]) (*P
 }
 
 type FormInfo struct {
-	Open          *time.Time
-	Close         *time.Time
-	RequiresLogin bool
+	Open     *time.Time
+	Close    *time.Time
+	LoginUrl string
 }
 
 func (s *Service) ClientGetFormInfo(ctx context.Context, req Request[struct {
-	Slug string `url:"param"`
+	Slug string `url:"query"`
 }, Nil]) (*FormInfo, error) {
 	slug := req.Query.Slug
 
 	var form FormInfo
+	var formRequiresLogin bool
+
 	formRow := s.db.QueryRowContext(ctx, `SELECT open, close, requires_login FROM form WHERE slug = ?`, slug)
-	if err := formRow.Scan(&form.Open, &form.Close, &form.RequiresLogin); err != nil {
+	if err := formRow.Scan(&form.Open, &form.Close, &formRequiresLogin); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, ErrNotFound("form not found: '%s'", slug)
 		}
 		return nil, Err(err)
 	}
 
+	if formRequiresLogin {
+		state := make([]byte, 16)
+		rand.Read(state)
+
+		token, err := jwt.NewWithClaims(jwt.SigningMethodHS512, &jwt.RegisteredClaims{
+			ExpiresAt: jwt.NewNumericDate(time.Now().Add(s.config.LOGIN_JWT_DURATION)),
+			Audience:  jwt.ClaimStrings{slug},
+			ID:        base64.StdEncoding.EncodeToString(state),
+		}).SignedString([]byte(s.config.LOGIN_JWT_SIGNING_KEY))
+		if err != nil {
+			return nil, Err(err)
+		}
+
+		session, err := s.GetProvider().BeginAuth(token)
+		if err != nil {
+			return nil, Err(err)
+		}
+
+		form.LoginUrl, err = session.GetAuthURL()
+		if err != nil {
+			return nil, Err(err)
+		}
+	}
+
 	return &form, nil
+}
+
+type CompleteLoginParams struct {
+	State       string `url:"query"`
+	Code        string `url:"query"`
+}
+
+// CompleteLoginParams.Get implements goth.Params interface
+func (params *CompleteLoginParams) Get(key string) string {
+	switch key {
+	case "code":
+		return params.Code
+	}
+	panic("CompleteLoginParams.Get() is only for getting oauth params")
+}
+
+type CompleteLoginRes struct {
+	Token string
+	Slug  string
+}
+
+func (s *Service) CompleteLogin(ctx context.Context, req Request[CompleteLoginParams, Nil]) (*CompleteLoginRes, error) {
+	var user goth.User
+	var formSlug string
+
+	{
+		token := req.Query.State
+		var claims jwt.RegisteredClaims
+		jwt, err := jwt.ParseWithClaims(token, &claims, func(token *jwt.Token) (any, error) {
+			if token.Method != jwt.SigningMethodHS512 {
+				return nil, ErrInvalidToken("bad signing method")
+			}
+			return []byte(s.config.LOGIN_JWT_SIGNING_KEY), nil
+		})
+		if err != nil {
+			return nil, ErrAuth("bad state: %s", err)
+		}
+		if !jwt.Valid {
+			return nil, ErrAuth("old state: %s", err)
+		}
+
+		provider := s.GetProvider()
+		session, err := provider.BeginAuth(token)
+		if err != nil {
+			return nil, Err(err)
+		}
+
+		_, err = session.Authorize(provider, &req.Query)
+		if err != nil {
+			return nil, Err(err)
+		}
+
+		user, err = provider.FetchUser(session)
+		if err != nil {
+			return nil, Err(err)
+		}
+
+		formSlug = claims.Audience[0]
+	}
+
+	// Create actual token for response
+	token, err := jwt.NewWithClaims(jwt.SigningMethodHS512, &jwt.RegisteredClaims{
+		ExpiresAt: jwt.NewNumericDate(time.Now().Add(s.config.RESPONSE_JWT_DURATION)),
+		Audience:  jwt.ClaimStrings{formSlug},
+		Subject:   user.Email,
+	}).SignedString([]byte(s.config.RESPONSE_JWT_SIGNING_KEY))
+	if err != nil {
+		return nil, Err(err)
+	}
+
+	return &CompleteLoginRes{
+		Token: token,
+		Slug:  formSlug,
+	}, nil
 }
 
 type CreateResponseReq struct {
@@ -342,10 +457,10 @@ func (s *Service) CreateResponse(ctx context.Context, req Request[Nil, CreateRes
 		}
 
 		now := RequestTimeFrom(ctx)
-		if formOpen != nil && formOpen.Before(now) {
+		if formOpen != nil && now.Before(*formOpen) {
 			return ErrNotFound("form '%s' opens at %v", data.Slug, formOpen)
 		}
-		if formClose != nil && formClose.After(now) {
+		if formClose != nil && now.After(*formClose) {
 			return ErrNotFound("form '%s' closed at %v", data.Slug, formClose)
 		}
 		if formEmailDomain != "" && !strings.HasSuffix(data.Email, "@"+formEmailDomain) {
@@ -460,12 +575,16 @@ func RunMigrations(ctx context.Context, db *sql.DB) error {
 }
 
 type Config struct {
-	API_URL string `default:""`
+	API_ADDR     string `default:":5000"`
+	FRONTEND_URL string `default:"http://localhost:3000"`
 
-	JWT_DURATION    time.Duration `default:"5m"`
-	JWT_SIGNING_KEY string        `default:""`
+	RESPONSE_JWT_DURATION    time.Duration `default:"15m"`
+	RESPONSE_JWT_SIGNING_KEY string        `default:"change-me"`
 
-	MAX_LOGIN_DURATION time.Duration `default:"5m"`
+	LOGIN_JWT_DURATION    time.Duration `default:"5m"`
+	LOGIN_JWT_SIGNING_KEY string        `default:"change-me"`
+
+	VALIDATION_JWT_SIGNING_KEY string `default:"change-me"`
 
 	OAUTH_GOOGLE_KEY    string `default:""`
 	OAUTH_GOOGLE_SECRET string `default:""`
@@ -520,12 +639,6 @@ func main() {
 		os.Exit(-1)
 	}
 
-	mux := http.NewServeMux()
-	m := NewMiddlewareGroup(
-		AddRequestTime,
-		LimitBody(2*1024),
-		LogRequests,
-	)
 	s := Service{
 		db: db,
 		client: http.Client{
@@ -534,15 +647,41 @@ func main() {
 		config: MustLoadConfig(),
 	}
 
+	mux := http.NewServeMux()
+	m := NewMiddlewareGroup(
+		AddRequestTime,
+		LimitBody(2*1024),
+		LogRequests,
+		func(next http.Handler) http.Handler {
+			return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				origin := r.Header.Get("Origin")
+				if origin == s.config.FRONTEND_URL {
+					h := w.Header()
+					h.Add("Access-Control-Allow-Origin", s.config.FRONTEND_URL)
+					h.Add("Access-Control-Allow-Methods", "GET, POST, PATCH, PUT, DELETE, OPTIONS")
+					h.Add("Access-Control-Allow-Headers", "Content-Type")
+					h.Add("Access-Control-Max-Age", "86400")
+				}
+				next.ServeHTTP(w, r)
+			})
+		},
+	)
+
+	mux.Handle("OPTIONS /", m.ApplyFn(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(200)
+	}))
+
 	mux.Handle("GET /", m.ApplyFn(func(w http.ResponseWriter, r *http.Request) {
 		w.Write([]byte("ok\n"))
 	}))
 
 	mux.Handle("PUT /PutForm", m.ApplyFn(HandleRequestReturner(s.PutForm)))
 	mux.Handle("POST /CreateResponse", m.ApplyFn(HandleRequestReturner(s.CreateResponse)))
+	mux.Handle("GET /ClientGetFormInfo", m.ApplyFn(HandleRequestReturner(s.ClientGetFormInfo)))
+	mux.Handle("POST /CompleteLogin", m.ApplyFn(HandleRequestReturner(s.CompleteLogin)))
 
 	server := http.Server{
-		Addr: ":5000",
+		Addr: s.config.API_ADDR,
 
 		ReadHeaderTimeout: 2 * time.Second,
 		ReadTimeout:       5 * time.Second,
