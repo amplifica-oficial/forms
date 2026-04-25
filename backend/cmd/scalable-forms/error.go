@@ -61,7 +61,7 @@ func getCodes(err error) (string, int) {
 			if es.OverrideErrorCode != "" {
 				return es.OverrideErrorCode, es.StatusCode
 			}
-			return es.Error.Error(), es.StatusCode
+			return err.(*Error).err, es.StatusCode
 		}
 	}
 	return "internal", http.StatusInternalServerError
@@ -153,6 +153,9 @@ func ErrConflict(fmt ...any) *Error { return newError("conflict", fmt...) }
 //
 // code: impossible
 func ErrImpossible(fmt ...any) *Error { return newError("impossible", fmt...) }
+
+// When an specific condition must be communicated to the client
+func ErrCode(code string, fmt ...any) *Error { return newError(code, fmt...) }
 
 // Error is the error type used by the API.
 // It is a wrapper around the standard error type that can trace the line where it was created

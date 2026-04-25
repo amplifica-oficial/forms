@@ -21,7 +21,7 @@ import (
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/markbates/goth"
 	"github.com/markbates/goth/providers/google"
-	_ "github.com/mattn/go-sqlite3"
+	_ "modernc.org/sqlite"
 )
 
 type Middleware = func(http.Handler) http.Handler
@@ -275,8 +275,6 @@ func (s *Service) PutForm(ctx context.Context, req Request[Nil, PutFormReq]) (*P
 }
 
 type FormInfo struct {
-	Open     *time.Time
-	Close    *time.Time
 	LoginUrl string
 }
 
@@ -287,13 +285,23 @@ func (s *Service) ClientGetFormInfo(ctx context.Context, req Request[struct {
 
 	var form FormInfo
 	var formRequiresLogin bool
+	var formOpen *time.Time
+	var formClose *time.Time
 
 	formRow := s.db.QueryRowContext(ctx, `SELECT open, close, requires_login FROM form WHERE slug = ?`, slug)
-	if err := formRow.Scan(&form.Open, &form.Close, &formRequiresLogin); err != nil {
+	if err := formRow.Scan(&formOpen, &formClose, &formRequiresLogin); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, ErrNotFound("form not found: '%s'", slug)
 		}
 		return nil, Err(err)
+	}
+
+	now := RequestTimeFrom(ctx)
+	if formOpen != nil && now.Before(*formOpen) {
+		return nil, ErrCode("request/before-open", "form '%s' opens at %v", slug, formOpen)
+	}
+	if formClose != nil && now.After(*formClose) {
+		return nil, ErrCode("request/after-close", "form '%s' closed at %v", slug, formClose)
 	}
 
 	if formRequiresLogin {
@@ -324,8 +332,8 @@ func (s *Service) ClientGetFormInfo(ctx context.Context, req Request[struct {
 }
 
 type CompleteLoginParams struct {
-	State       string `url:"query"`
-	Code        string `url:"query"`
+	State string `url:"query"`
+	Code  string `url:"query"`
 }
 
 // CompleteLoginParams.Get implements goth.Params interface
@@ -339,7 +347,6 @@ func (params *CompleteLoginParams) Get(key string) string {
 
 type CompleteLoginRes struct {
 	Token string
-	Slug  string
 }
 
 func (s *Service) CompleteLogin(ctx context.Context, req Request[CompleteLoginParams, Nil]) (*CompleteLoginRes, error) {
@@ -393,7 +400,6 @@ func (s *Service) CompleteLogin(ctx context.Context, req Request[CompleteLoginPa
 
 	return &CompleteLoginRes{
 		Token: token,
-		Slug:  formSlug,
 	}, nil
 }
 
@@ -401,6 +407,7 @@ type CreateResponseReq struct {
 	Slug  string
 	Email string
 	Name  string
+	Token string
 }
 
 func (r CreateResponseReq) Validate() string {
@@ -423,29 +430,48 @@ func (r CreateResponseReq) Validate() string {
 	return ""
 }
 
-type FormResponseToken struct {
-	Slug      string
-	Email     string
-	Name      string
-	CreatedAt time.Time
-	Signature string
+type FormResponseConfirmation struct {
+	CreatedAt       *time.Time `json:",omitempty"`
+	AlreadyAnswered bool       `json:",omitempty"`
 }
 
-func (s *Service) CreateResponse(ctx context.Context, req Request[Nil, CreateResponseReq]) (*FormResponseToken, error) {
+func (s *Service) CreateResponse(ctx context.Context, req Request[Nil, CreateResponseReq]) (*FormResponseConfirmation, error) {
 	data := req.Body
 
 	data.Slug = strings.TrimSpace(data.Slug)
 	data.Name = strings.TrimSpace(data.Name)
 	data.Email = strings.TrimSpace(data.Email)
 
-	if data.Name == "" || data.Email == "" {
-		return nil, ErrBadRequest("name or email missing")
+	if data.Token != "" {
+		var claims jwt.RegisteredClaims
+		jwt, err := jwt.ParseWithClaims(data.Token, &claims, func(token *jwt.Token) (any, error) {
+			if token.Method != jwt.SigningMethodHS512 {
+				return nil, ErrInvalidToken("bad signing method")
+			}
+			return []byte(s.config.RESPONSE_JWT_SIGNING_KEY), nil
+		})
+		if err != nil {
+			return nil, ErrAuth("bad jwt: %s", err)
+		}
+		if !jwt.Valid {
+			return nil, ErrAuth("invalid jwt: %s", err)
+		}
+		if claims.Audience[0] != data.Slug {
+			return nil, ErrBadRequest("token for other form: '%s'", claims.Subject)
+		}
+		data.Email = claims.Subject
+	}
+
+	if data.Email == "" {
+		return nil, ErrBadRequest("email or token missing")
 	}
 
 	var formID int
 	var formOpen, formClose *time.Time
 	var formEmailDomain string
 	var formRequiresLogin bool
+
+	confirmation := FormResponseConfirmation{}
 
 	if err := RunTx(ctx, s.db, func(db *sql.Tx) error {
 		formRow := db.QueryRowContext(ctx, `SELECT id, open, close, requires_login FROM form WHERE slug = ?`, data.Slug)
@@ -456,36 +482,37 @@ func (s *Service) CreateResponse(ctx context.Context, req Request[Nil, CreateRes
 			return Err(err)
 		}
 
+		if formRequiresLogin && data.Token == "" {
+			return ErrBadRequest("this forms requires login")
+		}
+
 		now := RequestTimeFrom(ctx)
 		if formOpen != nil && now.Before(*formOpen) {
-			return ErrNotFound("form '%s' opens at %v", data.Slug, formOpen)
+			return ErrCode("request/before-open", "form '%s' opens at %v", data.Slug, formOpen)
 		}
 		if formClose != nil && now.After(*formClose) {
-			return ErrNotFound("form '%s' closed at %v", data.Slug, formClose)
+			return ErrCode("request/after-close", "form '%s' closed at %v", data.Slug, formClose)
 		}
 		if formEmailDomain != "" && !strings.HasSuffix(data.Email, "@"+formEmailDomain) {
-			return ErrBadRequest("this email does not belong to the expected")
+			return ErrCode("request/bad-domain", "email '%s' does not belong to the domain '%s'", data.Email, formEmailDomain)
 		}
 
 		_, err := db.ExecContext(ctx, `INSERT INTO response (form_id, email, name, created_at) VALUES (?, ?, ?, ?)`, formID, data.Email, data.Name, Time(&now))
 		if err != nil {
+			if strings.Contains(err.Error(), "UNIQUE constraint failed") {
+				confirmation.AlreadyAnswered = true
+				return nil
+			}
 			return Err(err)
 		}
 
+		confirmation.CreatedAt = &now
 		return nil
 	}); err != nil {
 		return nil, err
 	}
 
-	token := FormResponseToken{
-		Slug:      data.Slug,
-		Email:     data.Email,
-		Name:      data.Name,
-		CreatedAt: RequestTimeFrom(ctx),
-		Signature: "i-say-its-ok",
-	}
-
-	return &token, nil
+	return &confirmation, nil
 }
 
 func RunTx(ctx context.Context, db *sql.DB, fn func(db *sql.Tx) error) error {
@@ -578,10 +605,10 @@ type Config struct {
 	API_ADDR     string `default:":5000"`
 	FRONTEND_URL string `default:"http://localhost:3000"`
 
-	RESPONSE_JWT_DURATION    time.Duration `default:"15m"`
+	RESPONSE_JWT_DURATION    time.Duration `default:"30m"`
 	RESPONSE_JWT_SIGNING_KEY string        `default:"change-me"`
 
-	LOGIN_JWT_DURATION    time.Duration `default:"5m"`
+	LOGIN_JWT_DURATION    time.Duration `default:"30m"`
 	LOGIN_JWT_SIGNING_KEY string        `default:"change-me"`
 
 	VALIDATION_JWT_SIGNING_KEY string `default:"change-me"`
@@ -626,7 +653,7 @@ func MustLoadConfig() Config {
 func main() {
 	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelDebug})))
 
-	db, err := sql.Open("sqlite3", "forms.db?cache=private&_fk=1&_journal=WAL&_writable_schema=0")
+	db, err := sql.Open("sqlite", "forms.db?cache=private&_fk=1&_journal=WAL&_writable_schema=0")
 	if err != nil {
 		slog.Error("db-open", "error", err)
 		os.Exit(-1)

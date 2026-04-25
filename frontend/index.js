@@ -1,34 +1,124 @@
+const API_BASE = window.location.hostname == 'localhost' ? 'http://localhost:5000' : 'https://forms.cert.ninja/api';
+const REDIRECT_TO = window.location.hostname == 'localhost' ? '' : 'https://cert.ninja';
 
-/** @type HTMLDivElement */
-let content;
+document.addEventListener('DOMContentLoaded', () => { 
+	onLoad().catch(err => {
+		PageError(content, getErrorMessage(err) || err);
 
-let formSlug = '';
-let token = '';
+		if (err.message.includes('no form') && REDIRECT_TO) {
+			window.location = REDIRECT_TO
+		}
+	})
+})
 
-const templateError = `
-<div>ERROR</div>
-`;
+async function onLoad() {
+	/** @type HTMLDivElement */
+	let content = document.getElementById('content');
 
-function FormLogin(loggedInAs, loginUrl) {
-	s = `<form id="formData">`;
-	if (loggedInAs) {
-		s += `<label>E-mail: <input type="email" id="email" disabled value="${loggedInAs}"/></label>`;
-	} else {
-		s += `<a href="${loginUrl}">login</a>`;
+	/** @type string | null */
+	let loginToken = null;
+
+	/** @type string | null */
+	let email = null;
+
+	const url = new URL(window.location.href);
+
+	let slug = url.pathname.replace(/^\//, '');
+	if (slug.includes('/')) {
+		throw new Error("form can't contain /")
 	}
-	s += `<br>`;
-	s += `<label>Name: <input type="text" id="name"  /></label>`;
-	s += `<input type="submit" value="Submit" ${loggedInAs ? '' : 'disabled'} />`;
-	s += `</form>`;
-	return s
+
+	if (url.searchParams.get('state')) {
+		const login = await execute('POST', '/CompleteLogin?' + url.searchParams);
+
+		// After login
+		loginToken = login.Token;
+
+		const claims = getClaims(loginToken);
+		slug = claims.form;
+		email = claims.email;
+
+		window.history.replaceState(null, '', url.origin + '/' + slug);
+	}
+
+	if (slug) {
+		const form = await execute('GET', withQuery('/ClientGetFormInfo', { slug }));
+
+		if (form.LoginUrl) {
+			PageFormLogin(content, slug, email, form.LoginUrl, loginToken);
+
+		} else {
+			PageFormNoLogin(content, slug);
+		}
+
+	} else {
+		throw new Error('no form');
+	}
 }
 
-function Submitted(token) {
-	return `<div>ok, your token is: ${token}</div>`;
+/** @param {HTMLElement} target */
+function PageError(target, err) {
+	target.innerHTML = `<div style="color: red;">${err}</div>`;
 }
 
-function FormNoLogin() {
-	return `<form id="formData">
+/** @param {HTMLElement} target */
+function PageSubmitted(target, submit) {
+	if (submit.AlreadyAnswered) {
+		target.innerHTML = `<div>Você já respondeu esse formulário</div>`;
+
+	} else {
+		const date = new Date(submit.CreatedAt);
+		target.innerHTML = `<div>Resposta registrada com sucesso<br>${date.toLocaleString()}</div>`;
+	}
+}
+
+/** @param {HTMLElement} target */
+function PageFormLogin(target, slug, email, loginUrl, token) {
+	target.innerHTML =  `<form id="form-${slug}">
+
+		${email ?
+			`<label>
+				E-mail:
+				<input type="email" id="email" disabled value="${email}"/>
+			</label>` : ''}
+
+		<a href="${loginUrl}">${email ? 'Trocar de conta' : 'login'}</a>
+
+		<br>
+
+		<label>
+			Name:
+			<input type="text" id="name" ${email ? '' : 'disabled=""'} />
+		</label>
+
+		<div id='error-target' style="color: red; display: hidden"></div>
+
+		<input type="submit" value="Submit" ${email ? '' : 'disabled'} />
+	</form>`;
+
+	document.getElementById(`form-${slug}`).addEventListener('submit', async (ev) => {
+		ev.preventDefault();
+
+		/** @type HTMLInputElement */
+		const nameInput = document.getElementById('name')
+
+		const name = nameInput.value;
+
+		try {
+			await submitData(target, slug, null, name, token);
+		} catch (err) {
+			const errorMessage = getErrorMessage(err) || err.message;
+			const errorTarget = document.getElementById('error-target');
+			errorTarget.innerText = errorMessage;
+			errorTarget.style.display = '';
+		}
+	})
+}
+
+
+/** @param {HTMLElement} target */
+function PageFormNoLogin(target, slug) {
+	target.innerHTML = `<form id="form-${slug}">
 		<label>
 			E-mail:
 			<input type="email" id="email" />
@@ -41,33 +131,62 @@ function FormNoLogin() {
 			<input type="text" id="name"  />
 		</label>
 
+		<div id='error-target' style="color: red; display: hidden"></div>
+
 		<input type="submit" value="Submit" />
 	</form>`
+
+	document.getElementById(`form-${slug}`).addEventListener('submit', async (ev) => {
+		ev.preventDefault();
+
+		/** @type HTMLInputElement */
+		const emailInput = document.getElementById('email')
+
+		/** @type HTMLInputElement */
+		const nameInput = document.getElementById('name')
+
+		const email = emailInput.value;
+		const name = nameInput.value;
+
+		try {
+			await submitData(target, slug, email, name, null);
+		} catch (err) {
+			const errorMessage = getErrorMessage(err) || err.message;
+			const errorTarget = document.getElementById('error-target');
+			errorTarget.innerText = errorMessage;
+			errorTarget.style.display = '';
+		}
+	})
 }
 
-/** @param {SubmitEvent} ev */
-async function onFormNoLoginSubmit(ev) {
-	ev.preventDefault();
+function getErrorMessage(err) {
+	if (err.message.includes('before-open')) {
+		return 'Esse formulário ainda não abriu';
+	}
+	if (err.message.includes('after-close')) {
+		return  "Esse formulário já fechou";
+	}
+	if (err.message.includes('bad-domain')) {
+		return   "Esse formulário precisa de uma conta de um domínio específico";
+	}
+	return null;
+}
 
-	/** @type HTMLInputElement */
-	const emailInput = document.getElementById('email')
-
-	/** @type HTMLInputElement */
-	const nameInput = document.getElementById('name')
-
-	const email = emailInput.value;
-	const name = nameInput.value;
-
-	const token = await execute('POST', '/CreateResponse', {
-		slug: formSlug,
+/**
+ * @param {HTMLElement} target
+ * @param {HTMLElement} errorTarget
+ * @returns 'before-open' | 'after-close' | 'bad-domain' | null
+ */
+async function submitData(target, slug, email, name, token) {
+	const submit = await execute('POST', '/CreateResponse', {
+		slug,
 		email,
 		name,
+		token,
 	});
 
-	content.innerHTML = Submitted(JSON.stringify(token));
+	PageSubmitted(target, submit);
 }
-
-const API_BASE = 'http://localhost:5000';
 
 /**
  * @param {'GET' | 'POST' | 'PUT' | 'PATCH' | 'DELETE'} method
@@ -82,10 +201,6 @@ async function execute(method, path, body = null) {
 		'Content-Type': 'application/json; charset=utf-8',
 	};
 
-	//if (this.auth?.loggedIn) {
-		//headers['Authorization'] = `Bearer ${this.auth.token}`;
-	//}
-
 	const res = await fetch(API_BASE + path, {
 		method,
 		headers,
@@ -95,7 +210,7 @@ async function execute(method, path, body = null) {
 	if (!res.ok) {
 		let err;
 		try {
-			err = (await res.json())?.message;
+			err = (await res.json())?.error;
 		} catch { }
 
 		throw new Error(`[${method}] ${path}: ${err || `${res.status} ${res.statusText}`}`);
@@ -131,43 +246,19 @@ function withQuery(path, params = null) {
 	return path + '?' + searchParams;
 }
 
-document.addEventListener('DOMContentLoaded', async () => {
-	content = document.getElementById('content');
+/** 
+ * @param {string} token
+ * @return {{ form: string, email: string }}
+ */
+function getClaims(token) {
+	/** @type string */
+	let payload = token.split('.')[1];
+	payload = window.atob(payload)
+	const data = JSON.parse(payload);
 
-	const url = new URL(window.location.href);
-	formSlug = url.pathname.replace(/^\//, '');
-	if (formSlug.includes('/')) {
-		content.innerHTML = templateError;
-		return;
+	return {
+		form: data.aud[0],
+		email: data.sub,
 	}
-
-	if (url.searchParams.get('state')) {
-		const login = await execute('POST', '/CompleteLogin?' + url.searchParams).catch(() => {
-			//window.location = 'https://cert.ninja';
-		})
-
-		// After login
-		formSlug = login.Slug;
-		token = login.Token;
-		window.history.replaceState(null, '', url.origin + '/' + formSlug);
-	}
-
-	if (formSlug) {
-		console.log(token)
-		const form = await execute('GET', withQuery('/ClientGetFormInfo', { 'slug': formSlug })).catch(() => {
-			//window.location = 'https://cert.ninja';
-		})
-
-		if (form.LoginUrl) {
-			content.innerHTML = FormLogin(null, form.LoginUrl);
-			return;
-		} else {
-			content.innerHTML = FormNoLogin();
-			document.getElementById('formData').addEventListener('submit', onFormNoLoginSubmit);
-			return;
-		}
-	} 
-
-	//window.location = 'https://cert.ninja';
-})
+}
 
