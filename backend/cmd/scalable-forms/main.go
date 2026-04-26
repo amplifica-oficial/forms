@@ -1,10 +1,12 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"database/sql"
 	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -15,6 +17,7 @@ import (
 	"os"
 	"reflect"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
@@ -181,9 +184,10 @@ func WithRequestTime(ctx context.Context, t time.Time) context.Context {
 }
 
 type Service struct {
-	client http.Client
-	db     *sql.DB
-	config Config
+	client    http.Client
+	db        *sql.DB
+	config    Config
+	keepAlive chan<- struct{}
 }
 
 func (s *Service) GetProvider() goth.Provider {
@@ -251,6 +255,7 @@ func (r PutFormReq) Validate() string {
 }
 
 func (s *Service) PutForm(ctx context.Context, req Request[Nil, PutFormReq]) (*PutFormReq, error) {
+	// TODO: Verify some token to allow this action
 	form := req.Body
 
 	now := RequestTimeFrom(ctx)
@@ -615,6 +620,11 @@ type Config struct {
 
 	OAUTH_GOOGLE_KEY    string `default:""`
 	OAUTH_GOOGLE_SECRET string `default:""`
+
+	SYNC_BATCH_SIZE        int  `default:"100"`
+	RECOVER_SYNC_RESPONSES bool `default:"true"`
+
+	INACTIVE_TIMEOUT time.Duration `default:"720h"`
 }
 
 func MustLoadConfig() Config {
@@ -644,16 +654,226 @@ func MustLoadConfig() Config {
 				panic(fmt.Sprintf("invalid duration '%s' for env %s", value, fieldType.Name))
 			}
 			fieldValue.SetInt(int64(duration))
+		case int, int32, int64:
+			v, err := strconv.ParseInt(value, 10, 64)
+			if err != nil {
+				panic(fmt.Sprintf("invalid int '%s' for env %s", value, fieldType.Name))
+			}
+			fieldValue.SetInt(v)
+		case bool:
+			v, err := strconv.ParseBool(value)
+			if err != nil {
+				panic(fmt.Sprintf("invalid bool '%s' for env %s", value, fieldType.Name))
+			}
+			fieldValue.SetBool(v)
+		default:
+			panic("unknown type")
 		}
 	}
 
 	return config
 }
 
+type SyncResponseData struct {
+	formID      int
+	target      string
+	targetToken string
+
+	Form      string                   `json:"form"`
+	Responses []SyncSingleResponseData `json:"responses"`
+}
+type SyncSingleResponseData struct {
+	id        int
+	Email     string    `json:"email"`
+	Name      string    `json:"name"`
+	CreatedAt time.Time `json:"createdAt"`
+}
+
+func (s *Service) ApplySync(data SyncResponseData) error {
+	url, err := url.Parse(data.target)
+	if err != nil {
+		return Err(err)
+	}
+
+	var buffer bytes.Buffer
+	err = json.NewEncoder(&buffer).Encode(data)
+	if err != nil {
+		return Err(err)
+	}
+
+	req := http.Request{
+		Method: http.MethodPost,
+		Body:   io.NopCloser(&buffer),
+		URL:    url,
+	}
+	if data.targetToken != "" {
+		req.Header.Add("Authorization", "Bearer "+data.targetToken)
+	}
+
+	res, err := s.client.Do(&req)
+	if err != nil {
+		return Err(err)
+	}
+	res.Body.Close()
+	if res.StatusCode < 200 || 299 < res.StatusCode {
+		// Not good
+		return ErrCode("sync/target-fail", "target '%s' failed with status '%v'", data.target, res.StatusCode)
+	}
+
+	var setSyncedQuery strings.Builder
+	setSyncedQuery.WriteString(`UPDATE response SET synced = 1 WHERE id in (`)
+	for i, r := range data.Responses {
+		if i != 0 {
+			setSyncedQuery.WriteString(",")
+		}
+		setSyncedQuery.WriteString(strconv.Itoa(r.id))
+	}
+	setSyncedQuery.WriteString(`)`)
+	_, err = s.db.Exec(setSyncedQuery.String())
+	return Err(err)
+}
+
+func (s *Service) doSyncResponses() error {
+	data := SyncResponseData{
+		Responses: make([]SyncSingleResponseData, 0, 4096),
+	}
+
+	rowsData := make([]struct {
+		FormID      int
+		Form        string
+		Target      string
+		TargetToken string
+		ResponseID  int
+		Email       string
+		Name        string
+		CreatedAt   time.Time
+	}, 4096)
+
+	for {
+		slog.Debug("start-sync")
+		var syncedAnything = false
+
+		rows, err := s.db.Query(`
+			SELECT f.id, f.slug, f.target, f.target_token, r.id, r.email, r.name, r.created_at
+			FROM response r
+			LEFT JOIN form f ON f.id = r.form_id
+			WHERE r.synced = 0 AND f.target != ''
+			ORDER BY r.form_id`)
+		if err != nil {
+			return Err(err)
+		}
+		defer rows.Close()
+
+		rowCount := 0
+		for rows.Next() {
+			if rowCount == 0 {
+				s.keepAlive <- struct{}{}
+			}
+
+			r := &rowsData[rowCount]
+			err := rows.Scan(&r.FormID, &r.Form, &r.Target, &r.TargetToken, &r.ResponseID, &r.Email, &r.Name, &r.CreatedAt)
+			if err != nil {
+				return Err(err)
+			}
+			rowCount++
+		}
+		if err := rows.Err(); err != nil {
+			return Err(err)
+		}
+		rows.Close()
+
+
+		for i := range rowCount {
+			r := &rowsData[i]
+			if (r.FormID != data.formID || len(data.Responses) == s.config.SYNC_BATCH_SIZE) && data.formID != 0 {
+				err := s.ApplySync(data)
+				if err != nil {
+					slog.Error("sync-batch-fail", "error", err.Error())
+				} else {
+					syncedAnything = true
+				}
+				data.Responses = data.Responses[:0]
+			}
+
+			data.formID = r.FormID
+			data.Form = r.Form
+			data.target = r.Target
+			data.targetToken = r.TargetToken
+			data.Responses = append(data.Responses, SyncSingleResponseData{
+				id:        r.ResponseID,
+				Email:     r.Email,
+				Name:      r.Name,
+				CreatedAt: r.CreatedAt,
+			})
+		}
+
+		if data.target != "" && len(data.Responses) != 0 {
+			err := s.ApplySync(data)
+			if err != nil {
+				slog.Error("sync-batch-fail", "error", err.Error())
+			} else {
+				syncedAnything = true
+			}
+			data.Responses = data.Responses[:0]
+		}
+
+		if !syncedAnything {
+			time.Sleep(5 * time.Second)
+		}
+	}
+}
+
+func (s *Service) recoverSyncResponses() (err error) {
+	if s.config.RECOVER_SYNC_RESPONSES {
+		defer func() {
+			if rec := recover(); rec != nil {
+				var ok bool
+				err, ok = rec.(error)
+				if ok {
+					return
+				}
+				err = fmt.Errorf("recovered: %v", rec)
+			}
+		}()
+	}
+
+	err = s.doSyncResponses()
+	return
+}
+
+func (s *Service) SyncResponses() {
+	err := s.recoverSyncResponses()
+	for err != nil {
+		slog.Error("sync-fail", "error", err)
+		err = s.recoverSyncResponses()
+	}
+}
+
+func (s *Service) EndProcessAfterInactiveTimeAndNoUnsyncedResponse(keepAlive <-chan struct{}, maxInactiveTime time.Duration) {
+	for {
+		select {
+		case <-time.After(maxInactiveTime):
+			// Inactive, exit but only if no unsynced responses
+			RunTx(context.Background(), s.db, func(db *sql.Tx) error {
+				row := db.QueryRow(`SELECT r.id FROM response r LEFT JOIN form f ON f.id = r.form_id WHERE r.synced = 0 AND f.target != '' LIMIT 1`)
+				var id int
+				err := row.Scan(&id)
+				if errors.Is(err, sql.ErrNoRows) {
+					slog.Info("inactive-shutdown")
+					os.Exit(0)
+				}
+				return nil
+			})
+		case <-keepAlive:
+			// ok
+		}
+	}
+}
+
 func main() {
 	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelDebug})))
 
-	db, err := sql.Open("sqlite", "forms.db?cache=private&_fk=1&_journal=WAL&_writable_schema=0")
+	db, err := sql.Open("sqlite", "forms.db?cache=shared&mode=rwc&_fk=1&_journal=WAL&_writable_schema=0")
 	if err != nil {
 		slog.Error("db-open", "error", err)
 		os.Exit(-1)
@@ -666,12 +886,14 @@ func main() {
 		os.Exit(-1)
 	}
 
+	keepAlive := make(chan struct{}, 128)
 	s := Service{
 		db: db,
 		client: http.Client{
 			Timeout: 10 * time.Second,
 		},
 		config: MustLoadConfig(),
+		keepAlive: keepAlive,
 	}
 
 	mux := http.NewServeMux()
@@ -681,6 +903,8 @@ func main() {
 		LogRequests,
 		func(next http.Handler) http.Handler {
 			return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				s.keepAlive <- struct{}{}
+
 				origin := r.Header.Get("Origin")
 				if origin == s.config.FRONTEND_URL {
 					h := w.Header()
@@ -716,6 +940,9 @@ func main() {
 
 		Handler: mux,
 	}
+
+	go s.SyncResponses()
+	go s.EndProcessAfterInactiveTimeAndNoUnsyncedResponse(keepAlive, s.config.INACTIVE_TIMEOUT)
 
 	slog.Info("start-server", "addr", server.Addr)
 	if err := server.ListenAndServe(); err != nil {
