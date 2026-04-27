@@ -255,8 +255,18 @@ func (r PutFormReq) Validate() string {
 }
 
 func (s *Service) PutForm(ctx context.Context, req Request[Nil, PutFormReq]) (*PutFormReq, error) {
-	// TODO: Verify some token to allow this action
 	form := req.Body
+
+	if s.config.API_TOKEN != "" {
+		auth := req.R.Header.Get("Authorization")
+		token, ok := strings.CutPrefix(auth, "Bearer ")
+		if !ok {
+			return nil, ErrAuth("no Bearer prefix in Authorization Header")
+		}
+		if token != s.config.API_TOKEN {
+			return nil, ErrAuth("bad token")
+		}
+	}
 
 	now := RequestTimeFrom(ctx)
 
@@ -610,13 +620,14 @@ type Config struct {
 	API_ADDR     string `default:":5000"`
 	FRONTEND_URL string `default:"http://localhost:3000"`
 
-	RESPONSE_JWT_DURATION    time.Duration `default:"30m"`
-	RESPONSE_JWT_SIGNING_KEY string        `default:"change-me"`
+	// Required
+	API_TOKEN                  string
+	RESPONSE_JWT_SIGNING_KEY   string
+	LOGIN_JWT_SIGNING_KEY      string
+	VALIDATION_JWT_SIGNING_KEY string
 
+	RESPONSE_JWT_DURATION time.Duration `default:"30m"`
 	LOGIN_JWT_DURATION    time.Duration `default:"30m"`
-	LOGIN_JWT_SIGNING_KEY string        `default:"change-me"`
-
-	VALIDATION_JWT_SIGNING_KEY string `default:"change-me"`
 
 	OAUTH_GOOGLE_KEY    string `default:""`
 	OAUTH_GOOGLE_SECRET string `default:""`
@@ -782,7 +793,6 @@ func (s *Service) doSyncResponses() error {
 		}
 		rows.Close()
 
-
 		for i := range rowCount {
 			r := &rowsData[i]
 			if (r.FormID != data.formID || len(data.Responses) == s.config.SYNC_BATCH_SIZE) && data.formID != 0 {
@@ -892,7 +902,7 @@ func main() {
 		client: http.Client{
 			Timeout: 10 * time.Second,
 		},
-		config: MustLoadConfig(),
+		config:    MustLoadConfig(),
 		keepAlive: keepAlive,
 	}
 

@@ -30,6 +30,7 @@ type Validator interface {
 type Request[Query any, Body Validator] struct {
 	Query Query
 	Body  Body
+	R *http.Request
 }
 
 type Requester[Q any, B Validator] func(ctx context.Context, request Request[Q, B]) error
@@ -56,6 +57,7 @@ func HandleRequester[Q any, B Validator](fn Requester[Q, B]) http.HandlerFunc {
 		err := fn(ctx, Request[Q, B]{
 			Query: *query,
 			Body:  *body,
+			R: r,
 		})
 		if err != nil {
 			return err
@@ -90,6 +92,7 @@ func HandleRequestReturner[Q any, B Validator, R any](fn RequestReturner[Q, B, R
 		ret, err := fn(ctx, Request[Q, B]{
 			Query: *query,
 			Body:  *body,
+			R: r,
 		})
 		if err != nil {
 			return err
