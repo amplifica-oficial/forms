@@ -761,7 +761,7 @@ func (s *Service) doSyncResponses() error {
 	}, 4096)
 
 	for {
-		slog.Debug("start-sync")
+		slog.Debug("sync-start")
 		var syncedAnything = false
 
 		rows, err := s.db.Query(`
@@ -776,6 +776,8 @@ func (s *Service) doSyncResponses() error {
 		defer rows.Close()
 
 		rowCount := 0
+		formCount := 0
+		currentForm := 0
 		for rows.Next() {
 			if rowCount == 0 {
 				s.keepAlive <- struct{}{}
@@ -786,12 +788,19 @@ func (s *Service) doSyncResponses() error {
 			if err != nil {
 				return Err(err)
 			}
+
+			if r.FormID != currentForm && currentForm != 0 {
+				formCount++
+				currentForm = r.FormID
+			}
 			rowCount++
 		}
 		if err := rows.Err(); err != nil {
 			return Err(err)
 		}
 		rows.Close()
+
+		slog.Debug("sync-found", "responses", rowCount, "forms", formCount)
 
 		for i := range rowCount {
 			r := &rowsData[i]
