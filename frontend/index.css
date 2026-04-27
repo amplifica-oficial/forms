@@ -1,0 +1,192 @@
+/* Tokens e Variáveis CSS (cert-ninja Design System) */
+:root {
+  /* Light Mode */
+  --background: 210 40% 97%;
+  --card: 0 0% 100%;
+  --muted: 210 40% 90%;
+  --muted-foreground: 215 16% 47%;
+  --foreground: 222 47% 11%;
+  
+  /* Brand Accent & States */
+  --red-500: 0 84% 60%;
+  --red-600: 0 72% 51%;
+  --destructive: 0 84% 60%; /* Mesma matiz principal, mas logicamente separada conforme regras */
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    /* Dark Mode (Navy Basis) */
+    --background: 221 39% 11%;
+    --card: 221 39% 11%; /* Todas as superfícies compartilham o mesmo valor no dark */
+    --muted: 215 24% 39%;
+    --muted-foreground: 215 20% 75%;
+    --foreground: 210 40% 98%;
+  }
+}
+
+/* Reset e Layout Base */
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  font-family: system-ui, -apple-system, sans-serif;
+  background-color: hsl(var(--background));
+  color: hsl(var(--foreground));
+  min-height: 100vh;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  position: relative;
+}
+
+/* Blobs Decorativos */
+.pointer-events-none { pointer-events: none; }
+.absolute { position: absolute; }
+.inset-0 { inset: 0; }
+.blobs-bg {
+  background: radial-gradient(ellipse at top right, rgba(239,68,68,0.06), transparent 40%),
+              radial-gradient(ellipse at bottom left, rgba(59,130,246,0.06), transparent 40%);
+  z-index: -1;
+}
+
+/* Content Container */
+#content {
+  width: 100%;
+  max-width: 440px;
+  padding: 1.5rem;
+  z-index: 1;
+}
+
+/* Tipografia e Tokens de Texto */
+.text-foreground { color: hsl(var(--foreground)); }
+.text-muted-foreground { color: hsl(var(--muted-foreground)); }
+.text-center { text-align: center; }
+h2 { margin: 0 0 0.5rem 0; font-size: 1.25rem; font-weight: 600; }
+p { margin: 0; font-size: 0.875rem; line-height: 1.5; }
+
+/* Hierarquia de Superfície: Cards */
+.card {
+  background-color: hsl(var(--card));
+  padding: 2rem;
+  border-radius: 0.75rem;
+  box-shadow: 0 4px 6px -1px rgb(0 0 0 / 0.1), 0 2px 4px -2px rgb(0 0 0 / 0.1);
+  border: 1px solid hsl(var(--muted) / 0.5);
+}
+
+@media (prefers-color-scheme: dark) {
+  .card {
+    box-shadow: 0 4px 6px -1px rgb(0 0 0 / 0.4);
+    border: 1px solid hsl(var(--muted) / 0.3);
+  }
+}
+
+/* Formulários */
+.form-layout {
+  display: flex;
+  flex-direction: column;
+  gap: 1.25rem;
+}
+
+label {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+  font-size: 0.875rem;
+  font-weight: 500;
+  color: hsl(var(--foreground));
+}
+
+.input-field {
+  background-color: hsl(var(--muted) / 0.3);
+  border: 1px solid hsl(var(--muted));
+  padding: 0.625rem 0.75rem;
+  border-radius: 0.5rem;
+  color: hsl(var(--foreground));
+  font-size: 0.875rem;
+  outline: none;
+  transition: border-color 0.2s;
+}
+
+.input-field:focus {
+  border-color: hsl(var(--red-500) / 0.4);
+}
+
+.input-field:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+  background-color: hsl(var(--muted) / 0.5);
+}
+
+/* Botões */
+.btn-primary {
+  background-color: hsl(var(--red-500));
+  color: white;
+  border: none;
+  padding: 0.625rem 1rem;
+  border-radius: 0.5rem;
+  font-size: 0.875rem;
+  font-weight: 500;
+  cursor: pointer;
+  transition: background-color 0.2s;
+  text-align: center;
+}
+
+.btn-primary:hover:not(:disabled) {
+  background-color: hsl(var(--red-600));
+}
+
+.btn-primary:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.btn-outline {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  background-color: transparent;
+  border: 1px solid hsl(var(--muted));
+  color: hsl(var(--foreground));
+  padding: 0.625rem 1rem;
+  border-radius: 0.5rem;
+  font-size: 0.875rem;
+  font-weight: 500;
+  text-decoration: none;
+  transition: all 0.2s;
+  cursor: pointer;
+}
+
+.btn-outline:hover {
+  border-color: hsl(var(--red-500) / 0.2);
+  background-color: hsl(var(--muted) / 0.3);
+}
+
+/* Identidade Visual: Padrão de Ícone */
+.icon-wrapper {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 0.5rem;
+  background-color: hsla(var(--red-500), 0.1); /* bg-red-500/10 */
+  padding: 0.5rem; /* p-2 */
+  color: hsl(var(--red-500)); /* text-red-500 */
+  margin-bottom: 1rem;
+}
+
+.icon-wrapper svg {
+  height: 1.25rem; /* h-5 */
+  width: 1.25rem;  /* w-5 */
+}
+
+/* Estados de Erro (NÃO usar brand red) */
+.error-box {
+  background-color: hsla(var(--destructive), 0.1);
+  color: hsl(var(--destructive));
+  border: 1px solid hsla(var(--destructive), 0.4);
+  padding: 0.75rem;
+  border-radius: 0.5rem;
+  font-size: 0.875rem;
+  font-weight: 500;
+}
