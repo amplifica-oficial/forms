@@ -1,0 +1,28 @@
+# fly.toml app configuration file generated for forms-cert-ninja on 2026-06-03T20:24:15Z
+#
+# See https://fly.io/docs/reference/configuration/ for information about how to use this file.
+#
+
+app = 'forms-cert-ninja'
+primary_region = 'gru'
+
+[env]
+INACTIVE_TIMEOUT="15m"
+FRONTEND_URL="https://forms.cert.ninja"
+OAUTH_GOOGLE_KEY="594508944460-4k73o5mql0o16sudsidlbuuejm878n0l.apps.googleusercontent.com"
+
+[build]
+
+[http_service]
+  internal_port = 5000
+  force_https = true
+  auto_stop_machines = 'stop'
+  auto_start_machines = true
+  min_machines_running = 0
+  processes = ['app']
+
+[[vm]]
+  memory = '1gb'
+  cpu_kind = 'shared'
+  cpus = 1
+  memory_mb = 256
