@@ -716,9 +716,11 @@ func (s *Service) ApplySync(data SyncResponseData) error {
 		Method: http.MethodPost,
 		Body:   io.NopCloser(&buffer),
 		URL:    url,
+		Header: make(http.Header),
 	}
+	req.Header.Add("Content-Type", "application/json")
+
 	if data.targetToken != "" {
-		req.Header = make(http.Header)
 		req.Header.Add("Authorization", "Bearer "+data.targetToken)
 	}
 
