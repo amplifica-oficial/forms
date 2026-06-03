@@ -14,5 +14,6 @@ FROM scratch
 COPY --from=builder /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
 COPY --from=builder /usr/src/app/server /server
 
+WORKDIR "/data"
 CMD ["/server"]
 

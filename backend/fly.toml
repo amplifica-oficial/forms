@@ -22,7 +22,12 @@ OAUTH_GOOGLE_KEY="594508944460-4k73o5mql0o16sudsidlbuuejm878n0l.apps.googleuserc
   processes = ['app']
 
 [[vm]]
-  memory = '1gb'
-  cpu_kind = 'shared'
-  cpus = 1
-  memory_mb = 256
+  size = 'performance-1x'
+
+[mounts]
+  source = "data"
+  destination = "/data"
+  auto_extend_size_threshold = 80
+  auto_extend_size_increment = "1GB"
+  auto_extend_size_limit = "5GB"
+
