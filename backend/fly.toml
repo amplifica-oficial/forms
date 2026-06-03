@@ -6,6 +6,11 @@
 app = 'forms-cert-ninja'
 primary_region = 'gru'
 
+[env]
+INACTIVE_TIMEOUT="15m"
+FRONTEND_URL="https://forms.cert.ninja"
+OAUTH_GOOGLE_KEY="594508944460-4k73o5mql0o16sudsidlbuuejm878n0l.apps.googleusercontent.com"
+
 [build]
 
 [http_service]
