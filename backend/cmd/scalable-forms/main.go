@@ -718,6 +718,7 @@ func (s *Service) ApplySync(data SyncResponseData) error {
 		URL:    url,
 	}
 	if data.targetToken != "" {
+		req.Header = make(http.Header)
 		req.Header.Add("Authorization", "Bearer "+data.targetToken)
 	}
 
