@@ -1,4 +1,4 @@
-const API_BASE = window.location.hostname == 'localhost' ? 'http://localhost:5000' : 'https://forms.cert.ninja/api';
+const API_BASE = window.location.hostname == 'localhost' ? 'http://localhost:5000' : 'https://api.forms.cert.ninja';
 const REDIRECT_TO = window.location.hostname == 'localhost' ? '' : 'https://cert.ninja';
 
 document.addEventListener('DOMContentLoaded', () => { 
