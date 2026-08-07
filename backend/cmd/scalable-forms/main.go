@@ -219,6 +219,7 @@ type PutFormReq struct {
 
 	EmailDomain  string
 	RequireLogin bool
+	AllowLogin   bool
 
 	Open  *time.Time
 	Close *time.Time
@@ -226,36 +227,36 @@ type PutFormReq struct {
 
 var reValidateSlug = regexp.MustCompile(`^[a-z\-]{3,}$`)
 
-func (r PutFormReq) Validate() string {
-	if !reValidateSlug.MatchString(r.Slug) {
-		return "slug"
+func (s *Service) PutForm(ctx context.Context, req Request[Nil, PutFormReq]) (*PutFormReq, error) {
+	form := req.Body
+
+	if !reValidateSlug.MatchString(form.Slug) {
+		return nil, ErrCode("request/slug", "bad slug")
 	}
 
-	if r.Target == "" {
-		return "target"
-	}
-	targetURL, err := url.Parse(r.Target)
-	if err != nil {
-		return "target"
-	}
-	if r.Target != targetURL.String() {
-		return "target"
-	}
-	if targetURL.Scheme != "https" && targetURL.Scheme != "http" {
-		return "target"
-	}
+	if form.Target != "" {
+		targetURL, err := url.Parse(form.Target)
+		if err != nil {
+			return nil, ErrCode("request/target", "bad target")
+		}
+		if form.Target != targetURL.String() {
+			return nil, ErrCode("request/target", "bad target")
+		}
 
-	if r.Open != nil && r.Close != nil {
-		if r.Open.After(*r.Close) {
-			return "time"
+		if targetURL.Scheme == "https" {
+			// ok
+		} else if targetURL.Scheme == "http" && s.config.ALLOW_INSECURE_TARGET {
+			// ok
+		} else {
+			return nil, ErrCode("request/target-scheme", "only https allowed")
 		}
 	}
 
-	return ""
-}
-
-func (s *Service) PutForm(ctx context.Context, req Request[Nil, PutFormReq]) (*PutFormReq, error) {
-	form := req.Body
+	if form.Open != nil && form.Close != nil {
+		if form.Open.After(*form.Close) {
+			return nil, ErrCode("request/bad-dates", "open can't be after close")
+		}
+	}
 
 	if s.config.API_TOKEN != "" {
 		auth := req.R.Header.Get("Authorization")
@@ -268,20 +269,25 @@ func (s *Service) PutForm(ctx context.Context, req Request[Nil, PutFormReq]) (*P
 		}
 	}
 
+	if form.RequireLogin {
+		form.AllowLogin = true
+	}
+
 	now := RequestTimeFrom(ctx)
 
 	_, err := s.db.ExecContext(ctx, `
-		INSERT INTO form (slug, target, target_token, open, close, requires_login, email_domain, created_at, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+		INSERT INTO form (slug, target, target_token, open, close, requires_login, allows_login, email_domain, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT (slug) DO UPDATE
 			SET target         = excluded.target,
 				target_token   = excluded.target_token,
 				open           = excluded.open,
 				close          = excluded.close,
 				requires_login = excluded.requires_login,
+				allows_login   = excluded.allows_login,
 				email_domain   = excluded.email_domain,
 				updated_at     = excluded.updated_at
-	`, form.Slug, form.Target, form.TargetToken, Time(form.Open), Time(form.Close), form.RequireLogin, form.EmailDomain, Time(&now), Time(&now))
+	`, form.Slug, form.Target, form.TargetToken, Time(form.Open), Time(form.Close), form.RequireLogin, form.AllowLogin, form.EmailDomain, Time(&now), Time(&now))
 	if err != nil {
 		return nil, Err(err)
 	}
@@ -290,7 +296,8 @@ func (s *Service) PutForm(ctx context.Context, req Request[Nil, PutFormReq]) (*P
 }
 
 type FormInfo struct {
-	LoginUrl string
+	LoginUrl      string
+	RequiresLogin bool
 }
 
 func (s *Service) ClientGetFormInfo(ctx context.Context, req Request[struct {
@@ -299,12 +306,12 @@ func (s *Service) ClientGetFormInfo(ctx context.Context, req Request[struct {
 	slug := req.Query.Slug
 
 	var form FormInfo
-	var formRequiresLogin bool
+	var formAllowsLogin bool
 	var formOpen *time.Time
 	var formClose *time.Time
 
-	formRow := s.db.QueryRowContext(ctx, `SELECT open, close, requires_login FROM form WHERE slug = ?`, slug)
-	if err := formRow.Scan(&formOpen, &formClose, &formRequiresLogin); err != nil {
+	formRow := s.db.QueryRowContext(ctx, `SELECT open, close, requires_login, allows_login FROM form WHERE slug = ?`, slug)
+	if err := formRow.Scan(&formOpen, &formClose, &form.RequiresLogin, &formAllowsLogin); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, ErrNotFound("form not found: '%s'", slug)
 		}
@@ -319,7 +326,7 @@ func (s *Service) ClientGetFormInfo(ctx context.Context, req Request[struct {
 		return nil, ErrCode("request/after-close", "form '%s' closed at %v", slug, formClose)
 	}
 
-	if formRequiresLogin {
+	if formAllowsLogin {
 		state := make([]byte, 16)
 		rand.Read(state)
 
@@ -425,26 +432,6 @@ type CreateResponseReq struct {
 	Token string
 }
 
-func (r CreateResponseReq) Validate() string {
-	if !reValidateSlug.MatchString(r.Slug) {
-		return "slug"
-	}
-
-	email, err := mail.ParseAddress(r.Email)
-	if err != nil {
-		return "e-mail"
-	}
-	if email.Address != r.Email {
-		return "e-mail"
-	}
-
-	if r.Name != strings.TrimSpace(r.Name) || r.Name == "" {
-		return "name"
-	}
-
-	return ""
-}
-
 type FormResponseConfirmation struct {
 	CreatedAt       *time.Time `json:",omitempty"`
 	AlreadyAnswered bool       `json:",omitempty"`
@@ -456,6 +443,10 @@ func (s *Service) CreateResponse(ctx context.Context, req Request[Nil, CreateRes
 	data.Slug = strings.TrimSpace(data.Slug)
 	data.Name = strings.TrimSpace(data.Name)
 	data.Email = strings.TrimSpace(data.Email)
+
+	if !reValidateSlug.MatchString(data.Slug) {
+		return nil, ErrCode("request/missing-slug", "no form")
+	}
 
 	if data.Token != "" {
 		var claims jwt.RegisteredClaims
@@ -478,7 +469,19 @@ func (s *Service) CreateResponse(ctx context.Context, req Request[Nil, CreateRes
 	}
 
 	if data.Email == "" {
-		return nil, ErrBadRequest("email or token missing")
+		return nil, ErrCode("request/missing-email", "email or token missing")
+	} else {
+		email, err := mail.ParseAddress(data.Email)
+		if err != nil {
+			return nil, ErrCode("request/bad-email", "email is not valid")
+		}
+		if email.Address != data.Email {
+			return nil, ErrCode("request/bad-email", "email is not in simplest form")
+		}
+	}
+
+	if data.Name == "" {
+		return nil, ErrCode("request/missing-name", "name is missing")
 	}
 
 	var formID int
@@ -498,7 +501,7 @@ func (s *Service) CreateResponse(ctx context.Context, req Request[Nil, CreateRes
 		}
 
 		if formRequiresLogin && data.Token == "" {
-			return ErrBadRequest("this forms requires login")
+			return ErrAuth("this form requires login")
 		}
 
 		now := RequestTimeFrom(ctx)
@@ -560,15 +563,17 @@ func RunMigrations(ctx context.Context, db *sql.DB) error {
 		return Err(err)
 	}
 
-	version := 0
+	applyiedVersion := 0
 
 	row := db.QueryRowContext(ctx, `SELECT coalesce(max(version), 0) FROM migration`)
-	if err = row.Scan(&version); err != nil {
+	if err = row.Scan(&applyiedVersion); err != nil {
 		return Err(err)
 	}
+	slog.Debug("starting", "applyiedVersion", applyiedVersion)
 
-	if version < 1 {
-		slog.Debug("db-migration-1")
+	thisVersion := 1
+	if applyiedVersion < thisVersion {
+		slog.Debug("run-migration", "applyiedVersion", applyiedVersion, "thisVersion", thisVersion)
 		err = RunTx(ctx, db, func(db *sql.Tx) error {
 			_, err := db.ExecContext(ctx, `CREATE TABLE form (
 				id   INTEGER PRIMARY KEY,
@@ -604,7 +609,31 @@ func RunMigrations(ctx context.Context, db *sql.DB) error {
 				return Err(err)
 			}
 
-			_, err = db.ExecContext(ctx, `INSERT INTO migration (version, migrated_at) VALUES (?, ?)`, 1, Now())
+			_, err = db.ExecContext(ctx, `INSERT INTO migration (version, migrated_at) VALUES (?, ?)`, thisVersion, Now())
+			if err != nil {
+				return Err(err)
+			}
+
+			return nil
+		})
+	}
+
+	thisVersion = 2
+	if applyiedVersion < thisVersion {
+		slog.Debug("run-migration", "applyiedVersion", applyiedVersion, "thisVersion", thisVersion)
+
+		err = RunTx(ctx, db, func(db *sql.Tx) error {
+			_, err := db.ExecContext(ctx, `ALTER TABLE form ADD allows_login BOOLEAN NOT NULL DEFAULT 0`)
+			if err != nil {
+				return Err(err)
+			}
+
+			_, err = db.ExecContext(ctx, `UPDATE form SET allows_login = 1 WHERE requires_login = 1`)
+			if err != nil {
+				return Err(err)
+			}
+
+			_, err = db.ExecContext(ctx, `INSERT INTO migration (version, migrated_at) VALUES (?, ?)`, thisVersion, Now())
 			if err != nil {
 				return Err(err)
 			}
@@ -635,7 +664,8 @@ type Config struct {
 	SYNC_BATCH_SIZE        int  `default:"100"`
 	RECOVER_SYNC_RESPONSES bool `default:"true"`
 
-	INACTIVE_TIMEOUT time.Duration `default:"720h"`
+	INACTIVE_TIMEOUT      time.Duration `default:"720h"`
+	ALLOW_INSECURE_TARGET bool          `default:"false"`
 }
 
 func MustLoadConfig() Config {

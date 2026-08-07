@@ -144,6 +144,7 @@ label {
 
 .btn-outline {
   display: inline-flex;
+  text-align: center;
   align-items: center;
   justify-content: center;
   background-color: transparent;
@@ -156,6 +157,7 @@ label {
   text-decoration: none;
   transition: all 0.2s;
   cursor: pointer;
+  flex-grow: 1;
 }
 
 .btn-outline:hover {
@@ -189,4 +191,27 @@ label {
   border-radius: 0.5rem;
   font-size: 0.875rem;
   font-weight: 500;
+}
+
+hr.or {
+	border: none;
+	border-top: 1px solid hsl(var(--muted-foreground));
+	color: hsl(var(--muted-foreground));
+	overflow: visible;
+	text-align: center;
+	height: 5px;
+	width: 100%;
+}
+
+hr.or::after {
+	background: white;
+	content: "ou";
+	padding: 0 4px;
+	position: relative;
+	top: -13px;
+}
+
+.btns-side-by-side {
+	display: flex;
+	gap: 0.2rem;
 }

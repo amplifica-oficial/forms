@@ -43,13 +43,7 @@ async function onLoad() {
 
     if (slug) {
         const form = await execute('GET', withQuery('/ClientGetFormInfo', { slug }));
-
-        if (form.LoginUrl) {
-            PageFormLogin(content, slug, email, form.LoginUrl, loginToken);
-
-        } else {
-            PageFormNoLogin(content, slug);
-        }
+		PageForm(content, slug, email, form.RequiresLogin, form.LoginUrl, loginToken);
 
     } else {
         throw new Error('no form');
@@ -86,42 +80,93 @@ function PageSubmitted(target, submit) {
 }
 
 /** @param {HTMLElement} target */
-function PageFormLogin(target, slug, email, loginUrl, token) {
-    target.innerHTML =  `
+function PageForm(target, slug, email, requireLogin, loginUrl, token) {
+    let html = `
     <div class="card">
-        <form id="form-${slug}" class="form-layout">
-            ${email ?
-                `<label>
-                    E-mail
-                    <input type="email" id="email" disabled value="${email}" class="input-field"/>
-                </label>` : ''}
+        <form id="form-${slug}" class="form-layout">`;
+			let insert_or = false;
+			if (email) {
+				html += `<label>
+					E-mail:
+					<input type="email" id="email" disabled value="${email}" class="input-field"/>
+				</label>
+				<div class='btns-side-by-side'>
+					<a href="${loginUrl}" class="btn-outline">
+						<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="margin-right: 8px;"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"></path></svg>
+						Trocar de conta
+					</a>
+					<a href="/${slug}" class="btn-outline">
+						Sair da conta
+					</a>
+				</div>
+				`
+			} else {
+				if (loginUrl) {
+					html += `<a href="${loginUrl}" class="btn-outline">
+						<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="margin-right: 8px;"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"></path></svg>
+						Login com Google
+					</a>`
+				}
+				if (!requireLogin) {
+					if (loginUrl) {
+						html += `<hr class='or' />`
+					}
+					html += `<label>
+						E-mail:
+						<input type="email" id="email" placeholder="seu@email.com" class="input-field" />
+					</label>`;
+				}
+			}
 
-            <a href="${loginUrl}" class="btn-outline">
-                <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="margin-right: 8px;"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"></path></svg>
-                ${email ? 'Trocar de conta' : 'Login com o Google'}
-            </a>
-
-            <label>
-                Nome
+			html +=
+            `<label>
+                Nome:
                 <input type="text" id="name" placeholder="Seu nome completo" class="input-field" ${email ? '' : 'disabled=""'} />
             </label>
 
             <div id='error-target' class="error-box" style="display: none;"></div>
 
-            <input type="submit" value="Enviar" class="btn-primary" ${email ? '' : 'disabled'} />
+            <input id='submit-btn' type="submit" value="Enviar" class="btn-primary" disabled="" />
         </form>
     </div>`;
+
+	target.innerHTML = html;
+
+	/** @type HTMLInputElement | null */
+	const emailInput = document.getElementById('email')
+
+	/** @type HTMLInputElement */
+	const nameInput = document.getElementById('name')
+
+	/** @type HTMLInputElement */
+	const submitBtn = document.getElementById('submit-btn')
+
+	if (emailInput) {
+		emailInput.addEventListener('input', (ev) => {
+			if (emailInput.value.trim() != '') {
+				nameInput.disabled = false;
+			} else {
+				nameInput.disabled = true;
+			}
+		})
+	}
+
+	nameInput.addEventListener('input', (ev) => {
+		if (nameInput.value.trim() != '') {
+			submitBtn.disabled = false;
+		} else {
+			submitBtn.disabled = true;
+		}
+	})
 
     document.getElementById(`form-${slug}`).addEventListener('submit', async (ev) => {
         ev.preventDefault();
 
-        /** @type HTMLInputElement */
-        const nameInput = document.getElementById('name')
-
         const name = nameInput.value;
+        const email = emailInput?.value ?? null;
 
         try {
-            await submitData(target, slug, null, name, token);
+            await submitData(target, slug, email, name, token);
         } catch (err) {
             const errorMessage = getErrorMessage(err) || err.message;
             const errorTarget = document.getElementById('error-target');
@@ -138,12 +183,12 @@ function PageFormNoLogin(target, slug) {
     <div class="card">
         <form id="form-${slug}" class="form-layout">
             <label>
-                E-mail
+                E-mail:
                 <input type="email" id="email" placeholder="seu@email.com" class="input-field" />
             </label>
 
             <label>
-                Nome
+                Nome:
                 <input type="text" id="name" placeholder="Seu nome completo" class="input-field" />
             </label>
 
@@ -186,15 +231,25 @@ function getErrorMessage(err) {
     if (err.message.includes('bad-domain')) {
         return "Esse formulário precisa de uma conta de um domínio específico";
     }
+    if (err.message.includes('missing-name')) {
+        return "Por favor, insira o seu nome completo";
+    }
+    if (err.message.includes('missing-email')) {
+        return "Por favor, insira o seu e-email";
+    }
     return null;
 }
 
 /**
  * @param {HTMLElement} target
- * @param {HTMLElement} errorTarget
+ * @param {string} slug
+ * @param {string | null} email
+ * @param {string} name
+ * @param {string} token
  * @returns 'before-open' | 'after-close' | 'bad-domain' | null
  */
 async function submitData(target, slug, email, name, token) {
+	name = name.trim();
     const submit = await execute('POST', '/CreateResponse', {
         slug,
         email,

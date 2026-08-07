@@ -13,29 +13,21 @@ import (
 
 type Nil struct {}
 
-func (Nil) Validate() string {
-	return ""
-}
-
 func IsNilType(v any) bool {
 	_, isConcrete := v.(Nil)
 	_, isPtr := v.(*Nil)
 	return isConcrete || isPtr
 }
 
-type Validator interface {
-	Validate() string
-}
-
-type Request[Query any, Body Validator] struct {
+type Request[Query any, Body any] struct {
 	Query Query
 	Body  Body
 	R *http.Request
 }
 
-type Requester[Q any, B Validator] func(ctx context.Context, request Request[Q, B]) error
+type Requester[Q any, B any] func(ctx context.Context, request Request[Q, B]) error
 
-func HandleRequester[Q any, B Validator](fn Requester[Q, B]) http.HandlerFunc {
+func HandleRequester[Q any, B any](fn Requester[Q, B]) http.HandlerFunc {
 	return HandleError(func(w http.ResponseWriter, r *http.Request) error {
 		ctx := r.Context()
 
@@ -68,9 +60,9 @@ func HandleRequester[Q any, B Validator](fn Requester[Q, B]) http.HandlerFunc {
 	})
 }
 
-type RequestReturner[Q any, B Validator, R any] func(ctx context.Context, request Request[Q, B]) (R, error)
+type RequestReturner[Q any, B any, R any] func(ctx context.Context, request Request[Q, B]) (R, error)
 
-func HandleRequestReturner[Q any, B Validator, R any](fn RequestReturner[Q, B, R]) http.HandlerFunc {
+func HandleRequestReturner[Q any, B any, R any](fn RequestReturner[Q, B, R]) http.HandlerFunc {
 	return HandleError(func(w http.ResponseWriter, r *http.Request) error {
 		ctx := r.Context()
 
