@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"crypto/subtle"
 	"database/sql"
 	"encoding/base64"
 	"encoding/json"
@@ -20,6 +21,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unsafe"
 
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/markbates/goth"
@@ -165,6 +167,16 @@ func AddRequestTime(next http.Handler) http.Handler {
 	})
 }
 
+func TimingSafeEqual(expected, other string) bool {
+	expectedBytes := unsafe.Slice(unsafe.StringData(expected), len(expected))
+	otherBytes := unsafe.Slice(unsafe.StringData(other), len(other))
+
+	if subtle.ConstantTimeEq(int32(len(expectedBytes)), int32(len(otherBytes))) == 0 {
+		return subtle.ConstantTimeCompare(expectedBytes, expectedBytes) == 0
+	}
+	return subtle.ConstantTimeCompare(expectedBytes, otherBytes) == 1
+}
+
 type ContextKey int
 
 const (
@@ -264,7 +276,7 @@ func (s *Service) PutForm(ctx context.Context, req Request[Nil, PutFormReq]) (*P
 		if !ok {
 			return nil, ErrAuth("no Bearer prefix in Authorization Header")
 		}
-		if token != s.config.API_TOKEN {
+		if TimingSafeEqual(s.config.API_TOKEN, token) {
 			return nil, ErrAuth("bad token")
 		}
 	}
